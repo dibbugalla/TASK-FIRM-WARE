@@ -1,0 +1,620 @@
+/* Vehicle Digital Cluster Firmware for nucleoL031
+ * Components: LCD Display, LEDs, Buzzer, Switches, Potentiometer, SD Card, Push Button
+ */
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stm32l0xx_hal.h>
+
+// Pin definitions
+#define LCD_RS_PIN GPIO_PIN_0
+#define LCD_EN_PIN GPIO_PIN_1
+#define LCD_D4_PIN GPIO_PIN_2
+#define LCD_D5_PIN GPIO_PIN_3
+#define LCD_D6_PIN GPIO_PIN_4
+#define LCD_D7_PIN GPIO_PIN_5
+
+#define LEFT_IND_LED_PIN  GPIO_PIN_6
+#define RIGHT_IND_LED_PIN GPIO_PIN_7
+#define BUZZER_PIN        GPIO_PIN_8
+#define KEY_SWITCH_PIN    GPIO_PIN_9
+#define SIDE_STAND_PIN    GPIO_PIN_10
+#define MODE_BTN_PIN      GPIO_PIN_11
+#define SET_TIME_BTN_PIN  GPIO_PIN_12
+
+#define POT_CHANNEL      ADC_CHANNEL_0
+#define SPEED_POT_CHANNEL ADC_CHANNEL_1
+
+// Global variables
+typedef struct {
+    uint8_t hours;
+    uint8_t minutes;
+    uint8_t seconds;
+    uint8_t day;
+    uint8_t month;
+    uint16_t year;
+} RTC_Time;
+
+typedef enum {
+    MODE_NORMAL,
+    MODE_FORWARD,
+    MODE_REVERSE
+} DriveMode;
+
+typedef struct {
+    uint8_t speed;
+    uint8_t battery_percentage;
+    uint8_t key_status;
+    uint8_t side_stand_status;
+    DriveMode drive_mode;
+    uint8_t left_indicator;
+    uint8_t right_indicator;
+} VehicleStatus;
+
+// Global objects
+ADC_HandleTypeDef hadc;
+TIM_HandleTypeDef htim2;
+RTC_Time system_time;
+VehicleStatus vehicle_status;
+FATFS fs;
+FIL file;
+
+// Function prototypes
+void SystemClock_Config(void);
+void GPIO_Init(void);
+void ADC_Init(void);
+void Timer_Init(void);
+void LCD_Init(void);
+void SD_Card_Init(void);
+uint16_t Read_ADC(uint32_t channel);
+void Update_Display(void);
+void Log_Data(void);
+void Process_Inputs(void);
+void Update_Time(void);
+void Set_Time_Mode(void);
+
+// Main function
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    GPIO_Init();
+    ADC_Init();
+    Timer_Init();
+    LCD_Init();
+    SD_Card_Init();
+
+    // Initialize default values
+    memset(&vehicle_status, 0, sizeof(VehicleStatus));
+    vehicle_status.drive_mode = MODE_NORMAL;
+
+    while (1) {
+        Process_Inputs();
+        Update_Display();
+        
+        // Log data every 5 seconds
+        static uint32_t last_log_time = 0;
+        if (HAL_GetTick() - last_log_time >= 5000) {
+            Log_Data();
+            last_log_time = HAL_GetTick();
+        }
+        
+        // Update time every second
+        static uint32_t last_time_update = 0;
+        if (HAL_GetTick() - last_time_update >= 1000) {
+            Update_Time();
+            last_time_update = HAL_GetTick();
+        }
+        
+        // Check for time setting mode
+        if (HAL_GPIO_ReadPin(GPIOA, SET_TIME_BTN_PIN) == GPIO_PIN_SET) {
+            Set_Time_Mode();
+        }
+    }
+}
+
+void Process_Inputs(void) {
+    // Read battery percentage from potentiometer
+    uint16_t adc_value = Read_ADC(POT_CHANNEL);
+    vehicle_status.battery_percentage = (adc_value * 100) / 4095;
+    
+    // Read speed from potentiometer
+    adc_value = Read_ADC(SPEED_POT_CHANNEL);
+    vehicle_status.speed = (adc_value * 120) / 4095; // Max speed 120 km/h
+    
+    // Read key status
+    vehicle_status.key_status = HAL_GPIO_ReadPin(GPIOA, KEY_SWITCH_PIN);
+    
+    // Read side stand status
+    vehicle_status.side_stand_status = HAL_GPIO_ReadPin(GPIOA, SIDE_STAND_PIN);
+    
+    // Process drive mode button
+    static uint8_t last_mode_btn = 0;
+    uint8_t mode_btn = HAL_GPIO_ReadPin(GPIOA, MODE_BTN_PIN);
+    if (mode_btn && !last_mode_btn) {
+        vehicle_status.drive_mode = (vehicle_status.drive_mode + 1) % 3;
+    }
+    last_mode_btn = mode_btn;
+    
+    // Process indicators (toggle with each read for simulation)
+    static uint32_t last_indicator_toggle = 0;
+    if (HAL_GetTick() - last_indicator_toggle >= 500) {
+        vehicle_status.left_indicator = !vehicle_status.left_indicator;
+        vehicle_status.right_indicator = !vehicle_status.right_indicator;
+        
+        HAL_GPIO_WritePin(GPIOA, LEFT_IND_LED_PIN, vehicle_status.left_indicator);
+        HAL_GPIO_WritePin(GPIOA, RIGHT_IND_LED_PIN, vehicle_status.right_indicator);
+        
+        last_indicator_toggle = HAL_GetTick();
+    }
+}
+
+void Update_Display(void) {
+    char line1[17], line2[17];
+    
+    // Format first line: Speed and Battery
+    snprintf(line1, sizeof(line1), "Spd:%3d Bat:%3d%%", 
+             vehicle_status.speed, vehicle_status.battery_percentage);
+    
+    // Format second line: Mode and Time
+    const char* mode_str[] = {"NORMAL", "FORWARD", "REVERSE"};
+    snprintf(line2, sizeof(line2), "%s %02d:%02d", 
+             mode_str[vehicle_status.drive_mode], system_time.hours, system_time.minutes);
+    
+    // Update LCD
+    LCD_SetCursor(0, 0);
+    LCD_PrintString(line1);
+    LCD_SetCursor(0, 1);
+    LCD_PrintString(line2);
+}
+
+void Log_Data(void) {
+    char log_buffer[100];
+    
+    // Format log entry
+    snprintf(log_buffer, sizeof(log_buffer), 
+             "%02d/%02d/%04d %02d:%02d:%02d,Speed:%d,Bat:%d%%,Mode:%d\r\n",
+             system_time.day, system_time.month, system_time.year,
+             system_time.hours, system_time.minutes, system_time.seconds,
+             vehicle_status.speed, vehicle_status.battery_percentage,
+             vehicle_status.drive_mode);
+    
+    // Open file in append mode
+    if (f_open(&file, "log.txt", FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
+        UINT bytes_written;
+        f_lseek(&file, f_size(&file));
+        f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
+        f_close(&file);
+    }
+}
+
+void Update_Time(void) {
+    system_time.seconds++;
+    if (system_time.seconds >= 60) {
+        system_time.seconds = 0;
+        system_time.minutes++;
+        if (system_time.minutes >= 60) {
+            system_time.minutes = 0;
+            system_time.hours++;
+            if (system_time.hours >= 24) {
+                system_time.hours = 0;
+                // Update date (simplified)
+                system_time.day++;
+            }
+        }
+    }
+}
+
+void Set_Time_Mode(void) {
+    uint8_t setting_mode = 0; // 0=hours, 1=minutes, 2=day, 3=month, 4=year
+    uint8_t exit_setting = 0;
+    
+    while (!exit_setting) {
+        char display_buffer[17];
+        
+        switch (setting_mode) {
+            case 0:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Hours: %02d", system_time.hours);
+                break;
+            case 1:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Mins: %02d", system_time.minutes);
+                break;
+            case 2:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Day: %02d", system_time.day);
+                break;
+            case 3:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Month: %02d", system_time.month);
+                break;
+            case 4:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Year: %04d", system_time.year);
+                break;
+        }
+        
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_PrintString(display_buffer);
+        
+        // Wait for button press
+        HAL_Delay(200); // Debounce
+        
+        if (HAL_GPIO_ReadPin(GPIOA, MODE_BTN_PIN)) {
+            setting_mode = (setting_mode + 1) % 5;
+        }
+        
+        if (HAL_GPIO_ReadPin(GPIOA, SET_TIME_BTN_PIN)) {
+            exit_setting = 1;
+        }
+        
+        // Use potentiometer to adjust value
+        uint16_t pot_value = Read_ADC(POT_CHANNEL);
+        switch (setting_mode) {
+            case 0:
+                system_time.hours = (pot_value * 24) / 4095;
+                break;
+            case 1:
+                system_time.minutes = (pot_value * 60) / 4095;
+                break;
+            case 2:
+                system_time.day = 1 + (pot_value * 30) / 4095;
+                break;
+            case 3:
+                system_time.month = 1 + (pot_value * 12) / 4095;
+                break;
+            case 4:
+                system_time.year = 2024 + (pot_value * 10) / 4095;
+                break;
+        }
+    }
+}
+
+// Initialize ADC for potentiometer readings
+void ADC_Init(void) {
+    // ADC initialization code here
+    ADC_ChannelConfTypeDef sConfig = {0};
+    
+    hadc.Instance = ADC1;
+    hadc.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+    hadc.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc.Init.LowPowerAutoWait = DISABLE;
+    hadc.Init.ContinuousConvMode = DISABLE;
+    hadc.Init.NbrOfConversion = 1;
+    hadc.Init.DiscontinuousConvMode = DISABLE;
+    hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    HAL_ADC_Init(&hadc);
+}
+
+uint16_t Read_ADC(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
+    HAL_ADC_ConfigChannel(&hadc, &sConfig);
+    
+    HAL_ADC_Start(&hadc);
+    HAL_ADC_PollForConversion(&hadc, 100);
+    uint16_t value = HAL_ADC_GetValue(&hadc);
+    HAL_ADC_Stop(&hadc);
+    
+    return value;
+}
+
+
+/*
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  Serial.println("Hello, STM32!");
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  delay(10); // this speeds up the simulation
+}
+
+/* Vehicle Digital Cluster Firmware for STM32C031C6
+ * Components: LCD Display, LEDs, Buzzer, Switches, Potentiometer, SD Card, Push Button
+ */
+
+#include "stm32c0xx_hal.h"
+//#include "fatfs.h"
+#include "string.h"
+#include "stdio.h"
+//#include "lcd.h"
+
+// Pin definitions
+#define LCD_RS_PIN GPIO_PIN_0
+#define LCD_EN_PIN GPIO_PIN_1
+#define LCD_D4_PIN GPIO_PIN_2
+#define LCD_D5_PIN GPIO_PIN_3
+#define LCD_D6_PIN GPIO_PIN_4
+#define LCD_D7_PIN GPIO_PIN_5
+
+#define LEFT_IND_LED_PIN  GPIO_PIN_6
+#define RIGHT_IND_LED_PIN GPIO_PIN_7
+#define BUZZER_PIN        GPIO_PIN_8
+#define KEY_SWITCH_PIN    GPIO_PIN_9
+#define SIDE_STAND_PIN    GPIO_PIN_10
+#define MODE_BTN_PIN      GPIO_PIN_11
+#define SET_TIME_BTN_PIN  GPIO_PIN_12
+
+#define POT_CHANNEL      ADC_CHANNEL_0
+#define SPEED_POT_CHANNEL ADC_CHANNEL_1
+
+// Global variables
+typedef struct {
+    uint8_t hours;
+    uint8_t minutes;
+    uint8_t seconds;
+    uint8_t day;
+    uint8_t month;
+    uint16_t year;
+} RTC_Time;
+
+typedef enum {
+    MODE_NORMAL,
+    MODE_FORWARD,
+    MODE_REVERSE
+} DriveMode;
+
+typedef struct {
+    uint8_t speed;
+    uint8_t battery_percentage;
+    uint8_t key_status;
+    uint8_t side_stand_status;
+    DriveMode drive_mode;
+    uint8_t left_indicator;
+    uint8_t right_indicator;
+} VehicleStatus;
+
+// Global objects
+ADC_HandleTypeDef hadc;
+TIM_HandleTypeDef htim2;
+RTC_Time system_time;
+VehicleStatus vehicle_status;
+FATFS fs;
+FIL file;
+
+// Function prototypes
+void SystemClock_Config(void);
+void GPIO_Init(void);
+void ADC_Init(void);
+void Timer_Init(void);
+void LCD_Init(void);
+void SD_Card_Init(void);
+uint16_t Read_ADC(uint32_t channel);
+void Update_Display(void);
+void Log_Data(void);
+void Process_Inputs(void);
+void Update_Time(void);
+void Set_Time_Mode(void);
+
+// Main function
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    GPIO_Init();
+    ADC_Init();
+    Timer_Init();
+    LCD_Init();
+    SD_Card_Init();
+
+    // Initialize default values
+    memset(&vehicle_status, 0, sizeof(VehicleStatus));
+    vehicle_status.drive_mode = MODE_NORMAL;
+
+    while (1) {
+        Process_Inputs();
+        Update_Display();
+        
+        // Log data every 5 seconds
+        static uint32_t last_log_time = 0;
+        if (HAL_GetTick() - last_log_time >= 5000) {
+            Log_Data();
+            last_log_time = HAL_GetTick();
+        }
+        
+        // Update time every second
+        static uint32_t last_time_update = 0;
+        if (HAL_GetTick() - last_time_update >= 1000) {
+            Update_Time();
+            last_time_update = HAL_GetTick();
+        }
+        
+        // Check for time setting mode
+        if (HAL_GPIO_ReadPin(GPIOA, SET_TIME_BTN_PIN) == GPIO_PIN_SET) {
+            Set_Time_Mode();
+        }
+    }
+}
+
+void Process_Inputs(void) {
+    // Read battery percentage from potentiometer
+    uint16_t adc_value = Read_ADC(POT_CHANNEL);
+    vehicle_status.battery_percentage = (adc_value * 100) / 4095;
+    
+    // Read speed from potentiometer
+    adc_value = Read_ADC(SPEED_POT_CHANNEL);
+    vehicle_status.speed = (adc_value * 120) / 4095; // Max speed 120 km/h
+    
+    // Read key status
+    vehicle_status.key_status = HAL_GPIO_ReadPin(GPIOA, KEY_SWITCH_PIN);
+    
+    // Read side stand status
+    vehicle_status.side_stand_status = HAL_GPIO_ReadPin(GPIOA, SIDE_STAND_PIN);
+    
+    // Process drive mode button
+    static uint8_t last_mode_btn = 0;
+    uint8_t mode_btn = HAL_GPIO_ReadPin(GPIOA, MODE_BTN_PIN);
+    if (mode_btn && !last_mode_btn) {
+        vehicle_status.drive_mode = (vehicle_status.drive_mode + 1) % 3;
+    }
+    last_mode_btn = mode_btn;
+    
+    // Process indicators (toggle with each read for simulation)
+    static uint32_t last_indicator_toggle = 0;
+    if (HAL_GetTick() - last_indicator_toggle >= 500) {
+        vehicle_status.left_indicator = !vehicle_status.left_indicator;
+        vehicle_status.right_indicator = !vehicle_status.right_indicator;
+        
+        HAL_GPIO_WritePin(GPIOA, LEFT_IND_LED_PIN, vehicle_status.left_indicator);
+        HAL_GPIO_WritePin(GPIOA, RIGHT_IND_LED_PIN, vehicle_status.right_indicator);
+        
+        last_indicator_toggle = HAL_GetTick();
+    }
+}
+
+void Update_Display(void) {
+    char line1[17], line2[17];
+    
+    // Format first line: Speed and Battery
+    snprintf(line1, sizeof(line1), "Spd:%3d Bat:%3d%%", 
+             vehicle_status.speed, vehicle_status.battery_percentage);
+    
+    // Format second line: Mode and Time
+    const char* mode_str[] = {"NORMAL", "FORWARD", "REVERSE"};
+    snprintf(line2, sizeof(line2), "%s %02d:%02d", 
+             mode_str[vehicle_status.drive_mode], system_time.hours, system_time.minutes);
+    
+    // Update LCD
+    LCD_SetCursor(0, 0);
+    LCD_PrintString(line1);
+    LCD_SetCursor(0, 1);
+    LCD_PrintString(line2);
+}
+
+void Log_Data(void) {
+    char log_buffer[100];
+    
+    // Format log entry
+    snprintf(log_buffer, sizeof(log_buffer), 
+             "%02d/%02d/%04d %02d:%02d:%02d,Speed:%d,Bat:%d%%,Mode:%d\r\n",
+             system_time.day, system_time.month, system_time.year,
+             system_time.hours, system_time.minutes, system_time.seconds,
+             vehicle_status.speed, vehicle_status.battery_percentage,
+             vehicle_status.drive_mode);
+    
+    // Open file in append mode
+    if (f_open(&file, "log.txt", FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
+        UINT bytes_written;
+        f_lseek(&file, f_size(&file));
+        f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
+        f_close(&file);
+    }
+}
+
+void Update_Time(void) {
+    system_time.seconds++;
+    if (system_time.seconds >= 60) {
+        system_time.seconds = 0;
+        system_time.minutes++;
+        if (system_time.minutes >= 60) {
+            system_time.minutes = 0;
+            system_time.hours++;
+            if (system_time.hours >= 24) {
+                system_time.hours = 0;
+                // Update date (simplified)
+                system_time.day++;
+            }
+        }
+    }
+}
+
+void Set_Time_Mode(void) {
+    uint8_t setting_mode = 0; // 0=hours, 1=minutes, 2=day, 3=month, 4=year
+    uint8_t exit_setting = 0;
+    
+    while (!exit_setting) {
+        char display_buffer[17];
+        
+        switch (setting_mode) {
+            case 0:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Hours: %02d", system_time.hours);
+                break;
+            case 1:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Mins: %02d", system_time.minutes);
+                break;
+            case 2:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Day: %02d", system_time.day);
+                break;
+            case 3:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Month: %02d", system_time.month);
+                break;
+            case 4:
+                snprintf(display_buffer, sizeof(display_buffer), "Set Year: %04d", system_time.year);
+                break;
+        }
+        
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_PrintString(display_buffer);
+        
+        // Wait for button press
+        HAL_Delay(200); // Debounce
+        
+        if (HAL_GPIO_ReadPin(GPIOA, MODE_BTN_PIN)) {
+            setting_mode = (setting_mode + 1) % 5;
+        }
+        
+        if (HAL_GPIO_ReadPin(GPIOA, SET_TIME_BTN_PIN)) {
+            exit_setting = 1;
+        }
+        
+        // Use potentiometer to adjust value
+        uint16_t pot_value = Read_ADC(POT_CHANNEL);
+        switch (setting_mode) {
+            case 0:
+                system_time.hours = (pot_value * 24) / 4095;
+                break;
+            case 1:
+                system_time.minutes = (pot_value * 60) / 4095;
+                break;
+            case 2:
+                system_time.day = 1 + (pot_value * 30) / 4095;
+                break;
+            case 3:
+                system_time.month = 1 + (pot_value * 12) / 4095;
+                break;
+            case 4:
+                system_time.year = 2024 + (pot_value * 10) / 4095;
+                break;
+        }
+    }
+}
+
+// Initialize ADC for potentiometer readings
+void ADC_Init(void) {
+    // ADC initialization code here
+    ADC_ChannelConfTypeDef sConfig = {0};
+    
+    hadc.Instance = ADC1;
+    hadc.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+    hadc.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc.Init.LowPowerAutoWait = DISABLE;
+    hadc.Init.ContinuousConvMode = DISABLE;
+    hadc.Init.NbrOfConversion = 1;
+    hadc.Init.DiscontinuousConvMode = DISABLE;
+    hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    HAL_ADC_Init(&hadc);
+}
+
+uint16_t Read_ADC(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
+    HAL_ADC_ConfigChannel(&hadc, &sConfig);
+    
+    HAL_ADC_Start(&hadc);
+    HAL_ADC_PollForConversion(&hadc, 100);
+    uint16_t value = HAL_ADC_GetValue(&hadc);
+    HAL_ADC_Stop(&hadc);
+    
+    return value;
+}
+
+*/
